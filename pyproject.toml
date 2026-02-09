@@ -9,5 +9,7 @@ dependencies = [
     "python-dotenv",
     "fastapi",
     "uvicorn",
+    "pycryptodome",
+    "requests",
 ]
 
