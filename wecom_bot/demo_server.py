@@ -293,7 +293,7 @@ def llm_invoke(question: str) -> tuple[str, str, bool]:
     """
     调用大模型获取回复（根据 USE_MOCK_LLM 切换真实/模拟）
 
-    真实模式：启动后台线程流式生成，首次返回 finish=False
+    真实模式：启动后台线程流式生成，立即返回 finish=False，由轮询获取内容
     模拟模式：使用 MockLLM 分步返回
 
     Args:
@@ -327,28 +327,9 @@ def llm_invoke(question: str) -> tuple[str, str, bool]:
     )
     thread.start()
 
-    # 等待直到有内容生成（最多等 5 秒）
-    for _ in range(50):
-        time.sleep(0.1)
-        with _llm_lock:
-            has_content = bool(_llm_cache[stream_id]["content"])
-            is_finished = _llm_cache[stream_id]["finished"]
-        if has_content or is_finished:
-            break
-
-    # 返回当前累积的全量内容
-    with _llm_lock:
-        content = _llm_cache[stream_id]["content"]
-        finished = _llm_cache[stream_id]["finished"]
-
-    if not content:
-        finished = False
-
-    logger.info(
-        "首次返回, stream_id=%s, content_length=%d, finished=%s",
-        stream_id, len(content), finished,
-    )
-    return stream_id, content, finished
+    # 立即返回，不阻塞。让企微通过 stream 轮询获取内容
+    logger.info("已启动流式生成, stream_id=%s, 等待轮询获取内容", stream_id)
+    return stream_id, "", False
 
 
 def llm_get_cached(stream_id: str) -> tuple[str, bool]:
