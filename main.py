@@ -45,7 +45,7 @@ async def health():
 async def main():
     # Railway 使用 PORT 环境变量
     port = int(os.getenv("PORT", 8000))
-    config = uvicorn.Config(main_app, host="0.0.0.0", port=port, log_level="info")
+    config = uvicorn.Config(main_app, host="0.0.0.0", port=port, log_level="debug")
     server = uvicorn.Server(config)
 
     print(f"Starting web server on http://0.0.0.0:{port}")

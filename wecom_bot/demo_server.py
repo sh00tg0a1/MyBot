@@ -2,27 +2,57 @@
 # coding=utf-8
 # 文档：https://developer.work.weixin.qq.com/document/path/101039
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import Response
-import uvicorn
-import os
-import logging
+import asyncio
+import base64
+import hashlib
 import json
+import logging
+import os
 import random
 import string
 import time
-import base64
-import hashlib
-# from urllib.parse import urlparse, parse_qs
-from wecom_bot.WXBizJsonMsgCrypt import WXBizJsonMsgCrypt
-from Crypto.Cipher import AES
+import threading
+
 import requests
+import uvicorn
+from Crypto.Cipher import AES
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import Response
 
-app = FastAPI()
+from wecom_bot.WXBizJsonMsgCrypt import WXBizJsonMsgCrypt
 
-# 常量定义
-CACHE_DIR = "/tmp/llm_demo_cache"
-MAX_STEPS = 10
+app = FastAPI(title="Wecom Bot API")
+
+
+@app.get("/")
+async def wecom_root():
+    """Wecom 服务状态"""
+    return {
+        "service": "wecom_bot",
+        "status": "running",
+        "endpoints": {
+            "verify": "GET /ai-bot/callback/demo/{botid}",
+            "message": "POST /ai-bot/callback/demo/{botid}",
+        }
+    }
+
+
+@app.get("/test")
+async def test_endpoint():
+    """测试端点 - 检查配置是否正确"""
+    import os
+    token = os.getenv('Token', '')
+    encoding_aes_key = os.getenv('EncodingAESKey', '')
+    return {
+        "token_configured": bool(token),
+        "encoding_aes_key_configured": bool(encoding_aes_key),
+        "token_length": len(token) if token else 0,
+        "encoding_aes_key_length": len(encoding_aes_key) if encoding_aes_key else 0,
+    }
+
+
+# 导入大模型
+from utils.llm import LLM, AnthropicLLM
 
 # 配置日志
 logging.basicConfig(
@@ -119,7 +149,7 @@ def MakeImageStream(stream_id, image_data, finish):
                 "msgtype": "stream",
                 "stream": {
                     "id": stream_id,
-                    "finish": finish, 
+                    "finish": finish,
                     "msg_item": [
                         {
                             "msgtype": "image",
@@ -152,16 +182,24 @@ def EncryptMessage(receiveid, nonce, timestamp, stream):
     return resp
 
 
-# TODO 这里模拟一个大模型的行为
-class LLMDemo():
+# ============================================================
+# Mock LLM - 模拟大模型，用于测试流式协议（不依赖外部服务）
+# ============================================================
+
+CACHE_DIR = "/tmp/llm_demo_cache"
+MAX_STEPS = 10
+
+
+class MockLLM:
+    """模拟大模型，分步返回结果，用于测试"""
+
     def __init__(self):
         self.cache_dir = CACHE_DIR
         if not os.path.exists(self.cache_dir):
             os.makedirs(self.cache_dir)
 
     def invoke(self, question):
-        stream_id = _generate_random_string(10) # 生成一个随机字符串作为任务ID
-        # 创建任务缓存文件
+        stream_id = _generate_random_string(10)
         cache_file = os.path.join(self.cache_dir, "%s.json" % stream_id)
         with open(cache_file, 'w', encoding='utf-8') as f:
             json.dump({
@@ -175,20 +213,19 @@ class LLMDemo():
     def get_answer(self, stream_id):
         cache_file = os.path.join(self.cache_dir, "%s.json" % stream_id)
         if not os.path.exists(cache_file):
-            return u"任务不存在或已过期"
+            return "任务不存在或已过期"
 
         with open(cache_file, 'r', encoding='utf-8') as f:
             task_data = json.load(f)
 
-        # 更新缓存
         current_step = task_data['current_step'] + 1
         task_data['current_step'] = current_step
         with open(cache_file, 'w', encoding='utf-8') as f:
             json.dump(task_data, f)
 
-        response = u'收到问题：%s\n' % task_data['question']
+        response = '收到问题：%s\n' % task_data['question']
         for i in range(current_step):
-            response += u'处理步骤 %d: 已完成\n' % (i)
+            response += '处理步骤 %d: 已完成\n' % (i)
 
         return response
 
@@ -201,6 +238,146 @@ class LLMDemo():
             task_data = json.load(f)
 
         return task_data['current_step'] >= task_data['max_steps']
+
+
+# ============================================================
+# Real LLM - 流式调用 OpenAI 大模型
+# ============================================================
+
+# 内存缓存：保存 LLM 流式回复
+# { stream_id: { "content": str, "sent_length": int, "finished": bool, "mock": bool } }
+# sent_length 记录已发送给客户端的内容长度，用于计算增量
+_llm_cache: dict[str, dict] = {}
+
+# 通过环境变量 USE_MOCK_LLM=true 切换为 MockLLM
+USE_MOCK_LLM = os.getenv("USE_MOCK_LLM", "false").lower() == "true"
+# 通过环境变量 USE_ANTHROPIC=true 使用 AnthropicLLM，否则使用 OpenAI LLM
+USE_ANTHROPIC = os.getenv("USE_ANTHROPIC", "false").lower() == "true"
+
+
+def _create_llm():
+    """根据环境变量创建对应的 LLM 实例"""
+    if USE_ANTHROPIC:
+        return AnthropicLLM()
+    return LLM()
+
+
+def _stream_worker(stream_id: str, question: str):
+    """
+    后台线程：流式调用大模型，逐步累积内容到缓存
+    """
+    try:
+        llm = _create_llm()
+        logger.info("开始流式生成, stream_id=%s, provider=%s", stream_id, "anthropic" if USE_ANTHROPIC else "openai")
+
+        for chunk in llm.chat_stream(question):
+            _llm_cache[stream_id]["content"] += chunk
+
+        _llm_cache[stream_id]["finished"] = True
+        logger.info(
+            "流式生成完成, stream_id=%s, total_length=%d",
+            stream_id,
+            len(_llm_cache[stream_id]["content"]),
+        )
+    except Exception as e:
+        logger.error("LLM 流式调用失败: %s", e)
+        _llm_cache[stream_id]["content"] += f"\n抱歉，AI 服务异常: {str(e)}"
+        _llm_cache[stream_id]["finished"] = True
+
+
+def llm_invoke(question: str) -> tuple[str, str, bool]:
+    """
+    调用大模型获取回复（根据 USE_MOCK_LLM 切换真实/模拟）
+
+    真实模式：启动后台线程流式生成，首次返回 finish=False
+    模拟模式：使用 MockLLM 分步返回
+
+    Args:
+        question: 用户问题
+
+    Returns:
+        (stream_id, answer, finish)
+    """
+    if USE_MOCK_LLM:
+        mock = MockLLM()
+        stream_id = mock.invoke(question)
+        answer = mock.get_answer(stream_id)
+        finish = mock.is_task_finish(stream_id)
+        _llm_cache[stream_id] = {"mock": True}
+        return stream_id, answer, finish
+
+    stream_id = _generate_random_string(10)
+
+    # 初始化缓存
+    _llm_cache[stream_id] = {
+        "content": "",
+        "sent_length": 0,
+        "finished": False,
+        "mock": False,
+    }
+
+    # 启动后台线程进行流式生成
+    thread = threading.Thread(
+        target=_stream_worker,
+        args=(stream_id, question),
+        daemon=True,
+    )
+    thread.start()
+
+    # 等待一小段时间，让第一批内容生成
+    time.sleep(0.5)
+
+    content = _llm_cache[stream_id]["content"]
+    finished = _llm_cache[stream_id]["finished"]
+
+    # 取增量部分
+    delta = content[_llm_cache[stream_id]["sent_length"]:]
+    _llm_cache[stream_id]["sent_length"] = len(content)
+
+    if not delta:
+        delta = "正在思考中..."
+        finished = False
+
+    logger.info(
+        "首次返回, stream_id=%s, delta_length=%d, finished=%s",
+        stream_id, len(delta), finished,
+    )
+    return stream_id, delta, finished
+
+
+def llm_get_cached(stream_id: str) -> tuple[str, bool]:
+    """
+    获取缓存中的 LLM 回复（用于 stream 轮询）
+
+    Args:
+        stream_id: 流ID
+
+    Returns:
+        (answer, finish)
+    """
+    cached = _llm_cache.get(stream_id)
+    if not cached:
+        return "任务不存在或已过期", True
+
+    # MockLLM 使用文件缓存
+    if cached.get("mock"):
+        mock = MockLLM()
+        answer = mock.get_answer(stream_id)
+        finish = mock.is_task_finish(stream_id)
+        return answer, finish
+
+    content = cached["content"]
+    finished = cached["finished"]
+
+    # 取增量：只返回上次发送之后新生成的内容
+    delta = content[cached["sent_length"]:]
+    cached["sent_length"] = len(content)
+
+    if not delta and not finished:
+        # 还在生成但暂时没有新内容
+        return "", False
+
+    return delta, finished
 
 
 @app.get("/ai-bot/callback/demo/{botid}")
@@ -267,22 +444,18 @@ async def handle_message(
     msgtype = data['msgtype']
     if (msgtype == 'text'):
         content = data['text']['content']
+        logger.info("收到文本消息: %s", content)
 
-        # 询问大模型产生回复
-        llm = LLMDemo()
-        stream_id = llm.invoke(content)
-        answer = llm.get_answer(stream_id)
-        finish = llm.is_task_finish(stream_id)
+        # 调用大模型获取回复
+        stream_id, answer, finish = llm_invoke(content)
 
         stream = MakeTextStream(stream_id, answer, finish)
         resp = EncryptMessage(receiveid, nonce, timestamp, stream)
         return Response(content=resp, media_type="text/plain")
     elif (msgtype == 'stream'):  # case stream
-        # 询问大模型最新的回复
+        # 获取缓存中的回复
         stream_id = data['stream']['id']
-        llm = LLMDemo()
-        answer = llm.get_answer(stream_id)
-        finish = llm.is_task_finish(stream_id)
+        answer, finish = llm_get_cached(stream_id)
 
         stream = MakeTextStream(stream_id, answer, finish)
         resp = EncryptMessage(receiveid, nonce, timestamp, stream)
