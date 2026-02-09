@@ -245,9 +245,10 @@ class MockLLM:
 # ============================================================
 
 # 内存缓存：保存 LLM 流式回复
-# { stream_id: { "content": str, "sent_length": int, "finished": bool, "mock": bool } }
-# sent_length 记录已发送给客户端的内容长度，用于计算增量
+# { stream_id: { "content": str, "finished": bool, "mock": bool } }
+# 企微 stream 协议：每次返回全量 content，客户端用新内容替换旧内容
 _llm_cache: dict[str, dict] = {}
+_llm_lock = threading.Lock()  # 保护 _llm_cache 的读写
 
 # 通过环境变量 USE_MOCK_LLM=true 切换为 MockLLM
 USE_MOCK_LLM = os.getenv("USE_MOCK_LLM", "false").lower() == "true"
@@ -271,18 +272,21 @@ def _stream_worker(stream_id: str, question: str):
         logger.info("开始流式生成, stream_id=%s, provider=%s", stream_id, "anthropic" if USE_ANTHROPIC else "openai")
 
         for chunk in llm.chat_stream(question):
-            _llm_cache[stream_id]["content"] += chunk
+            with _llm_lock:
+                _llm_cache[stream_id]["content"] += chunk
 
-        _llm_cache[stream_id]["finished"] = True
-        logger.info(
-            "流式生成完成, stream_id=%s, total_length=%d",
-            stream_id,
-            len(_llm_cache[stream_id]["content"]),
-        )
+        with _llm_lock:
+            _llm_cache[stream_id]["finished"] = True
+            logger.info(
+                "流式生成完成, stream_id=%s, total_length=%d",
+                stream_id,
+                len(_llm_cache[stream_id]["content"]),
+            )
     except Exception as e:
         logger.error("LLM 流式调用失败: %s", e)
-        _llm_cache[stream_id]["content"] += f"\n抱歉，AI 服务异常: {str(e)}"
-        _llm_cache[stream_id]["finished"] = True
+        with _llm_lock:
+            _llm_cache[stream_id]["content"] += f"\n抱歉，AI 服务异常: {str(e)}"
+            _llm_cache[stream_id]["finished"] = True
 
 
 def llm_invoke(question: str) -> tuple[str, str, bool]:
@@ -311,7 +315,6 @@ def llm_invoke(question: str) -> tuple[str, str, bool]:
     # 初始化缓存
     _llm_cache[stream_id] = {
         "content": "",
-        "sent_length": 0,
         "finished": False,
         "mock": False,
     }
@@ -327,24 +330,25 @@ def llm_invoke(question: str) -> tuple[str, str, bool]:
     # 等待直到有内容生成（最多等 5 秒）
     for _ in range(50):
         time.sleep(0.1)
-        if _llm_cache[stream_id]["content"] or _llm_cache[stream_id]["finished"]:
+        with _llm_lock:
+            has_content = bool(_llm_cache[stream_id]["content"])
+            is_finished = _llm_cache[stream_id]["finished"]
+        if has_content or is_finished:
             break
 
-    content = _llm_cache[stream_id]["content"]
-    finished = _llm_cache[stream_id]["finished"]
+    # 返回当前累积的全量内容
+    with _llm_lock:
+        content = _llm_cache[stream_id]["content"]
+        finished = _llm_cache[stream_id]["finished"]
 
-    # 取增量部分
-    delta = content[_llm_cache[stream_id]["sent_length"]:]
-    _llm_cache[stream_id]["sent_length"] = len(content)
-
-    if not delta:
+    if not content:
         finished = False
 
     logger.info(
-        "首次返回, stream_id=%s, delta_length=%d, finished=%s",
-        stream_id, len(delta), finished,
+        "首次返回, stream_id=%s, content_length=%d, finished=%s",
+        stream_id, len(content), finished,
     )
-    return stream_id, delta, finished
+    return stream_id, content, finished
 
 
 def llm_get_cached(stream_id: str) -> tuple[str, bool]:
@@ -368,18 +372,15 @@ def llm_get_cached(stream_id: str) -> tuple[str, bool]:
         finish = mock.is_task_finish(stream_id)
         return answer, finish
 
-    content = cached["content"]
-    finished = cached["finished"]
+    # 返回当前累积的全量内容（企微会用新内容替换旧内容）
+    with _llm_lock:
+        content = cached["content"]
+        finished = cached["finished"]
 
-    # 取增量：只返回上次发送之后新生成的内容
-    delta = content[cached["sent_length"]:]
-    cached["sent_length"] = len(content)
-
-    if not delta and not finished:
-        # 还在生成但暂时没有新内容
+    if not content and not finished:
         return "", False
 
-    return delta, finished
+    return content, finished
 
 
 @app.get("/ai-bot/callback/demo/{botid}")
