@@ -324,8 +324,11 @@ def llm_invoke(question: str) -> tuple[str, str, bool]:
     )
     thread.start()
 
-    # 等待一小段时间，让第一批内容生成
-    time.sleep(0.5)
+    # 等待直到有内容生成（最多等 5 秒）
+    for _ in range(50):
+        time.sleep(0.1)
+        if _llm_cache[stream_id]["content"] or _llm_cache[stream_id]["finished"]:
+            break
 
     content = _llm_cache[stream_id]["content"]
     finished = _llm_cache[stream_id]["finished"]
