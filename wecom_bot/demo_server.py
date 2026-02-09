@@ -335,7 +335,6 @@ def llm_invoke(question: str) -> tuple[str, str, bool]:
     _llm_cache[stream_id]["sent_length"] = len(content)
 
     if not delta:
-        delta = "正在思考中..."
         finished = False
 
     logger.info(
